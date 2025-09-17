@@ -6,8 +6,10 @@ import * as glob from "@actions/glob";
 
 import { getTemporaryDirectory } from "./actions-util";
 import { getTotalCacheSize } from "./caching-utils";
+import { CodeQL } from "./codeql";
 import { Config } from "./config-utils";
 import { EnvVar } from "./environment";
+import { Feature, Features } from "./feature-flags";
 import { KnownLanguage, Language } from "./languages";
 import { Logger } from "./logging";
 import { getRequiredEnvParam } from "./util";
@@ -87,15 +89,17 @@ async function makeGlobber(patterns: string[]): Promise<glob.Globber> {
 /**
  * Attempts to restore dependency caches for the languages being analyzed.
  *
+ * @param codeql The CodeQL instance to use.
+ * @param features Information about which FFs are enabled.
  * @param languages The languages being analyzed.
  * @param logger A logger to record some informational messages to.
- * @param minimizeJavaJars Whether the Java extractor should rewrite downloaded JARs to minimize their size.
  * @returns A list of languages for which dependency caches were restored.
  */
 export async function downloadDependencyCaches(
+  codeql: CodeQL,
+  features: Features,
   languages: Language[],
   logger: Logger,
-  minimizeJavaJars: boolean,
 ): Promise<Language[]> {
   const restoredCaches: Language[] = [];
 
@@ -120,9 +124,9 @@ export async function downloadDependencyCaches(
       continue;
     }
 
-    const primaryKey = await cacheKey(language, cacheConfig, minimizeJavaJars);
+    const primaryKey = await cacheKey(codeql, features, language, cacheConfig);
     const restoreKeys: string[] = [
-      await cachePrefix(language, minimizeJavaJars),
+      await cachePrefix(codeql, features, language),
     ];
 
     logger.info(
@@ -151,14 +155,16 @@ export async function downloadDependencyCaches(
 /**
  * Attempts to store caches for the languages that were analyzed.
  *
+ * @param codeql The CodeQL instance to use.
+ * @param features Information about which FFs are enabled.
  * @param config The configuration for this workflow.
  * @param logger A logger to record some informational messages to.
- * @param minimizeJavaJars Whether the Java extractor should rewrite downloaded JARs to minimize their size.
  */
 export async function uploadDependencyCaches(
+  codeql: CodeQL,
+  features: Features,
   config: Config,
   logger: Logger,
-  minimizeJavaJars: boolean,
 ): Promise<void> {
   for (const language of config.languages) {
     const cacheConfig = getDefaultCacheConfig()[language];
@@ -201,7 +207,7 @@ export async function uploadDependencyCaches(
       continue;
     }
 
-    const key = await cacheKey(language, cacheConfig, minimizeJavaJars);
+    const key = await cacheKey(codeql, features, language, cacheConfig);
 
     logger.info(
       `Uploading cache of size ${size} for ${language} with key ${key}...`,
@@ -229,31 +235,35 @@ export async function uploadDependencyCaches(
 /**
  * Computes a cache key for the specified language.
  *
+ * @param codeql The CodeQL instance to use.
+ * @param features Information about which FFs are enabled.
  * @param language The language being analyzed.
  * @param cacheConfig The cache configuration for the language.
- * @param minimizeJavaJars Whether the Java extractor should rewrite downloaded JARs to minimize their size.
  * @returns A cache key capturing information about the project(s) being analyzed in the specified language.
  */
 async function cacheKey(
+  codeql: CodeQL,
+  features: Features,
   language: Language,
   cacheConfig: CacheConfig,
-  minimizeJavaJars: boolean = false,
 ): Promise<string> {
   const hash = await glob.hashFiles(cacheConfig.hash.join("\n"));
-  return `${await cachePrefix(language, minimizeJavaJars)}${hash}`;
+  return `${await cachePrefix(codeql, features, language)}${hash}`;
 }
 
 /**
  * Constructs a prefix for the cache key, comprised of a CodeQL-specific prefix, a version number that
  * can be changed to invalidate old caches, the runner's operating system, and the specified language name.
  *
+ * @param codeql The CodeQL instance to use.
+ * @param features Information about which FFs are enabled.
  * @param language The language being analyzed.
- * @param minimizeJavaJars Whether the Java extractor should rewrite downloaded JARs to minimize their size.
  * @returns The prefix that identifies what a cache is for.
  */
 async function cachePrefix(
+  codeql: CodeQL,
+  features: Features,
   language: Language,
-  minimizeJavaJars: boolean,
 ): Promise<string> {
   const runnerOs = getRequiredEnvParam("RUNNER_OS");
   const customPrefix = process.env[EnvVar.DEPENDENCY_CACHING_PREFIX];
@@ -264,6 +274,10 @@ async function cachePrefix(
   }
 
   // To ensure a safe rollout of JAR minimization, we change the key when the feature is enabled.
+  const minimizeJavaJars = await features.getValue(
+    Feature.JavaMinimizeDependencyJars,
+    codeql,
+  );
   if (language === KnownLanguage.java && minimizeJavaJars) {
     prefix = `minify-${prefix}`;
   }
